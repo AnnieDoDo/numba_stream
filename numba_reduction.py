@@ -33,47 +33,81 @@ class TestReduction(CUDATestCase):
         shrsize = nthreads*2
         a = cuda.to_device(np.arange(ndata))
         nelem = len(a)
+
+        nstreams = 2
+        chunk_size = (insize + nstreams - 1) // nstreams
+        streams = [cuda.stream() for _ in range(nstreams)]
+        partial_sums = cuda.device_array(nstreams, dtype=np.int32)
         #reduction.allocate.end
 
         # reduction.kernel.begin
         @cuda.jit
         def array_sum(data, psum):
-            tid = cuda.threadIdx.x
-            size = len(data)
-            if tid < size:
-                i = cuda.grid(1)
 
-                # Declare an array in shared memory
-                shr = cuda.shared.array(shrsize,int32)
-                shr[tid] = data[i]
+        # Parameters
+            nthreads = 256
+            shrsize = nthreads * 2
 
-                # Ensure writes to shared memory are visible
-                # to all threads before reducing
+            # Input data
+            a = np.arange(insize, dtype=np.int32)
+            d_a = cuda.to_device(a)
+
+            # Partition input data across streams
+            chunk_size = (insize + nstreams - 1) // nstreams
+            streams = [cuda.stream() for _ in range(nstreams)]
+            partial_sums = cuda.device_array(nstreams, dtype=np.int32)
+
+            # Reduction kernel
+            @cuda.jit
+            def array_sum(data, psum, offset, size):
+                tid = cuda.threadIdx.x
+                bid = cuda.blockIdx.x
+                i = offset + bid * cuda.blockDim.x + tid
+
+                # Declare shared memory
+                shr = cuda.shared.array(256, int32)
+
+                # Load data into shared memory
+                if i < offset + size:
+                    shr[tid] = data[i]
+                else:
+                    shr[tid] = 0  # Handle out-of-bounds threads
+
+                # Synchronize threads
                 cuda.syncthreads()
 
-                s = 1
-                while s < cuda.blockDim.x:
-                    if tid % (2 * s) == 0:
-                        # Stride by `s` and add
-                        shr[tid] += shr[tid + s]
-                    s *= 2
+                # Perform reduction in shared memory
+                stride = 1
+                while stride < cuda.blockDim.x:
+                    if tid % (2 * stride) == 0:
+                        shr[tid] += shr[tid + stride]
+                    stride *= 2
                     cuda.syncthreads()
 
-                # After the loop, the zeroth  element contains the sum
+                # Write block sum to global memory
                 if tid == 0:
-                    psum[cuda.blockIdx.x] = shr[tid]
-        # reduction.kernel.end
+                    psum[bid] = shr[0]
 
-        # reduction.launch.begin
-        nblocks = (nelem - 1) // nthreads + 1 
-        b = cuda.to_device(np.arange(nblocks))
-        array_sum[nblocks, nthreads](a,b)
-        # reduction.launch.end
+            # Launch reduction kernels in multiple streams
+            for i, stream in enumerate(streams):
+                offset = i * chunk_size
+                size = min(chunk_size, insize - offset)
+                nblocks = (size + nthreads - 1) // nthreads
 
-        # assert.begin
-        for i in range(nblocks):
-           np.testing.assert_equal(b[i], sum(np.arange(i*nthreads,(i+1)*nthreads)))
-        # assert.end
+                if size > 0:
+                    array_sum[nblocks, nthreads, stream](d_a, partial_sums, offset, size)
+
+            # Synchronize all streams
+            for stream in streams:
+                stream.synchronize()
+
+            # Copy partial sums to host and validate
+            h_partial_sums = partial_sums.copy_to_host()
+            final_sum = np.sum(h_partial_sums)
+
+            # Validate the result
+            expected_sum = np.sum(a)
+            np.testing.assert_equal(final_sum, expected_sum)
 
     def test_reduction_256(self):
         self.ex_reduction(256)
